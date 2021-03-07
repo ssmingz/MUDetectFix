@@ -21,12 +21,17 @@ import edu.iastate.cs.egroum.aug.*;
 import org.eclipse.jdt.core.dom.*;
 import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
 
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.util.*;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 public class AUGFix {
     private static final Logger LOGGER = Logger.getLogger(AUGFix.class.getSimpleName());
+    private static final int MAX_FIX = 30;
 
     private final List<Violation> violations = new ArrayList<>();
     private List<CompilationUnit> fixedTargets = new ArrayList<>();
@@ -46,12 +51,15 @@ public class AUGFix {
     private int newVarId, mistakeId;
     private int failed = 0, successed = 0;
 
+    private String OUTPUT_PREFIX = "./fixedFile/";
+
     public AUGFix(List<Violation> violations) {
         this.violations.addAll(violations);
     }
 
     public List<CompilationUnit> findFixes() {
-        for(Violation aViolation : this.violations) {
+        for(int i=0; i<this.MAX_FIX; i++) {
+            Violation aViolation = this.violations.get(i);
             CompilationUnit fixedTarget = findFix(aViolation);
             this.fixedTargets.add(fixedTarget);
             this.violationId++;
@@ -86,13 +94,14 @@ public class AUGFix {
             }
         }
         this.missingNodes.removeAll(removeList);
+        removeList.clear();
         // 第二种情况：target中含有不只一个pattern类似实例，导致每次匹配时可能会交叉匹配
         // 解决：把missingEdge.source加进missingNodes
         for(Edge edge : this.anOverlap.getMissingEdges()) {
             // 只有在（1）missingEdge是order类型
             if(edge instanceof OrderEdge) {
                 BaseNode ps = (BaseNode) edge.getSource(), pt = (BaseNode) edge.getTarget();
-                if(!this.missingNodes.contains(ps) && !missingNodes.contains(pt)) {
+                if(!this.missingNodes.contains(ps) && !this.missingNodes.contains(pt)) {
                     // （2）且source.sourceLineNumber>target.sourceLineNumber时(否则可能只是匹配上两个pattern类似实例)
                     BaseNode ts = (BaseNode) this.anOverlap.getMappedTargetNode(ps);
                     BaseNode tt = (BaseNode) this.anOverlap.getMappedTargetNode(pt);
@@ -118,8 +127,17 @@ public class AUGFix {
                 if(!this.missingNodes.contains(ps) && !missingNodes.contains(pt))
                     this.missingNodes.add(edge.getTarget());
             }
+            // 重新再检查一遍
+            for(Node node : this.missingNodes) {
+                for(Edge edge2 : this.aPattern.outgoingEdgesOf(node)) {
+                    if(edge2 instanceof DefinitionEdge && !this.anOverlap.getMissingNodes().contains(this.aPattern.getEdgeTarget(edge2))) {
+                        removeList.add(node);
+                    }
+                }
+            }
+            this.missingNodes.removeAll(removeList);
+            removeList.clear();
         }
-        this.missingNodes = this.anOverlap.getMissingNodes().stream().filter(p -> p instanceof ActionNode).collect(Collectors.toList());
         // before traversing, sort nodes by id from largest to smallest (from bottom to up in AUG)
         this.missingNodes.sort(new Comparator<Node>() {
             @Override
@@ -161,6 +179,7 @@ public class AUGFix {
         }
         if(mistakeId == -1) {
             logPrefix += "Successfully fix in Violation#";
+            generateFixedFile(fixedTarget);
             this.successed++;
         }
         else {
@@ -171,6 +190,23 @@ public class AUGFix {
                 + " in [target] " + this.aTarget.getLocation().getFilePath() + " "
                 + this.aTarget.getLocation().getMethodSignature());
         return fixedTarget;
+    }
+
+    private void generateFixedFile(CompilationUnit fix) {
+        String outputPath = this.OUTPUT_PREFIX + this.violationId + "_"
+                + this.aTarget.getLocation().getMethodSignature().substring(0, this.aTarget.getLocation().getMethodSignature().indexOf('('))
+                + ".java";
+        File outputFile = new File(outputPath);
+        try (FileOutputStream fop = new FileOutputStream(outputFile)) {
+            outputFile.createNewFile();
+            byte[] contentInBytes = fix.toString().getBytes(); // get the content in bytes
+            fop.write(contentInBytes);
+            fop.flush();
+            fop.close();
+            System.out.println("Generate fix " + outputPath + " done");
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
     }
 
     private void initialReferenceTarget() {
