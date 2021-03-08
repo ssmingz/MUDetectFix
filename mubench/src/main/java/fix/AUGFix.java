@@ -386,7 +386,11 @@ public class AUGFix {
         });
         Node mappedNode = null;
         for(Node node : tBranchNodes) {
-            if (!this.missingNodes.contains(node)
+            // missingNodes包含要添加的ActionNodes，是所有缺失节点的一部分，所以!contains包括已匹配节点和部分缺失节点
+            // addedNodesToBeDeleted包含已添加的ActionNodes，表示之前缺失的现在已匹配
+            // 所有节点分为missing和mapped两类，this.missingNodes在两类都有涉及，实际匹配的是mapped中去除this.missingNodes的
+            if ( (this.anOverlap.getTargetNodeByPatternNode().keySet().contains(node)
+                    && !this.missingNodes.contains(node))
                     || this.addedNodesToBeDeleted.contains(this.addedTargetNodes.inverse().get(node))) {
                 mappedNode = node;
                 break;
@@ -546,7 +550,8 @@ public class AUGFix {
             });
             Node mappedNode = null;
             for(Node node : tBranchNodes) {
-                if (!this.missingNodes.contains(node)
+                if( (this.anOverlap.getTargetNodeByPatternNode().keySet().contains(node)
+                        && !this.missingNodes.contains(node))
                         || this.addedNodesToBeDeleted.contains(this.addedTargetNodes.inverse().get(node))) {
                     mappedNode = node;
                     break;
@@ -963,9 +968,13 @@ public class AUGFix {
                 }
             }
         }
-        // 出边不含def边，说明是单纯的函数调用语句
-        ExpressionStatement tExpStmt = this.tAST.newExpressionStatement((Expression) tASTNode);
-        return tExpStmt;
+        // 出边不含def边，说明是：单纯的函数调用语句/return语句/
+        Statement newStmt;
+        if(tASTNode instanceof Statement)
+            newStmt = (Statement) tASTNode;
+        else
+            newStmt = this.tAST.newExpressionStatement((Expression) tASTNode);
+        return newStmt;
     }
 
     private ASTNode buildTargetNode(Node mNode) {
