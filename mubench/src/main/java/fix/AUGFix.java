@@ -292,8 +292,22 @@ public class AUGFix {
             mappedStmt = mappedStmt.getParent();
         }
         originBlock = mappedStmt.getParent();
+        // 如果then/else/for内只有一行语句且没被括住，那么originBlock为IfStmt节点
         if(!(originBlock instanceof Block)) {
-            int i=0;
+            Block newBlock = this.tAST.newBlock();
+            if(originBlock instanceof IfStatement) {
+                if(isInThenStmt((IfStatement) originBlock, mappedStmt))
+                    ((IfStatement) originBlock).setThenStatement(newBlock);
+                else
+                    ((IfStatement) originBlock).setElseStatement(newBlock);
+                newBlock.statements().add(mappedStmt);
+                originBlock = newBlock;
+            }
+            else if(originBlock instanceof ForStatement) {
+                ((ForStatement) originBlock).setBody(newBlock);
+                newBlock.statements().add(mappedStmt);
+                originBlock = newBlock;
+            }
         }
         int mappedIndex = ((Block) originBlock).statements().indexOf(mappedStmt);
         // 该已匹配节点在待插入节点的前面，则在其之后插入
@@ -565,6 +579,23 @@ public class AUGFix {
                     mappedStmt = mappedStmt.getParent();
                 }
                 originBlock = mappedStmt.getParent();
+                // 如果then/else/for内只有一行语句且没被括住，那么originBlock为IfStmt节点
+                if(!(originBlock instanceof Block)) {
+                    Block newBlock = this.tAST.newBlock();
+                    if(originBlock instanceof IfStatement) {
+                        if(isInThenStmt((IfStatement) originBlock, mappedStmt))
+                            ((IfStatement) originBlock).setThenStatement(newBlock);
+                        else
+                            ((IfStatement) originBlock).setElseStatement(newBlock);
+                        newBlock.statements().add(mappedStmt);
+                        originBlock = newBlock;
+                    }
+                    else if(originBlock instanceof ForStatement) {
+                        ((ForStatement) originBlock).setBody(newBlock);
+                        newBlock.statements().add(mappedStmt);
+                        originBlock = newBlock;
+                    }
+                }
                 int mappedIndex = ((Block) originBlock).statements().indexOf(mappedStmt);
                 // 如果是构造函数
                 if(returnType.equals("isConstructor")) {
@@ -679,8 +710,12 @@ public class AUGFix {
                     while(!(tStmt instanceof Statement)) {
                         tStmt = tStmt.getParent();
                     }
-                    int mappedIndex = catchClause.getBody().statements().indexOf(tStmt);
-                    catchClause.getBody().statements().addAll(mappedIndex, tmpStmts);
+                    //int mappedIndex = catchClause.getBody().statements().indexOf(tStmt);
+                    // 因为tStmt_block可能不是CatchClause的Block，可能是CatchBody中的某个语句的Block
+                    Block tStmt_block = (Block) tStmt.getParent();
+                    int mappedIndex = tStmt_block.statements().indexOf(tStmt);
+                    //catchClause.getBody().statements().addAll(mappedIndex, tmpStmts);
+                    tStmt_block.statements().addAll(mappedIndex, tmpStmts);
                     tmpStmts.clear();
                 }
                 // 缺失的节点
@@ -1043,19 +1078,36 @@ public class AUGFix {
         // operator
         tNode.setOperator(InfixExpression.Operator.toOperator(pNode.getOperator().toString()));
         // left operand
-        Expression tLeftOpr = buildTargetNode(pNode.getLeftOperand());
+        Expression tLeftOpr = createTargetASTNode(pNode.getLeftOperand());
         tNode.setLeftOperand(tLeftOpr);
         // right operand
-        Expression tRightOpr = buildTargetNode(pNode.getRightOperand());
+        Expression tRightOpr = createTargetASTNode(pNode.getRightOperand());
         tNode.setRightOperand(tRightOpr);
         return tNode;
     }
 
-    private MethodInvocation buildTargetNode(MethodCallNode mNode) {
+    private ClassInstanceCreation createTargetASTNode(ClassInstanceCreation pNode) {
+        ClassInstanceCreation tNode = this.tAST.newClassInstanceCreation();
+        // type
+        Name typeName = this.tAST.newName(pNode.getType().toString());
+        Type newType = this.tAST.newSimpleType(typeName);
+        tNode.setType(newType);
+        // args
+        for(Object arg : pNode.arguments()) {
+            Expression newArg = createTargetASTNode((Expression) arg);
+            tNode.arguments().add(newArg);
+        }
+        return tNode;
+    }
+
+    private ASTNode buildTargetNode(MethodCallNode mNode) {
         MethodInvocation tNode;
         if(hasArgs(mNode, this.aPattern)) {
             ASTNode pNode = ((BaseNode) mNode).egroumNode.getAstNode();
-            return createTargetASTNode((MethodInvocation) pNode);
+            if(pNode instanceof ClassInstanceCreation)
+                return createTargetASTNode((ClassInstanceCreation) pNode);
+            else
+                return createTargetASTNode((MethodInvocation) pNode);
         }
         tNode = this.tAST.newMethodInvocation();
         // method name
@@ -1121,7 +1173,7 @@ public class AUGFix {
         }
     }
 
-    private SimpleName buildTargetNode(SimpleName pNode) {
+    private SimpleName createTargetASTNode(SimpleName pNode) {
         String pVar = pNode.getIdentifier();
         // get mapped
         String tVar = findMappedVar(pVar);
@@ -1129,16 +1181,23 @@ public class AUGFix {
         return tNode;
     }
 
-    private Expression buildTargetNode(Expression pNode) {
-        // single var
-        if(pNode instanceof SimpleName) {
-            return buildTargetNode((SimpleName) pNode);
-        }
-        // qualified name
-        else {
-            return (Expression) ASTNode.copySubtree(this.tAST, pNode);
+    private Expression createTargetASTNode(Expression pNode) {
+        if(pNode instanceof SimpleName) { // single var
+            return createTargetASTNode((SimpleName) pNode);
         }
         //TODO: also need to consider when expression is a method invocation
+        else if(pNode instanceof ClassInstanceCreation) {
+            return createTargetASTNode((ClassInstanceCreation) pNode);
+        }
+        else if(pNode instanceof MethodInvocation) {
+            return createTargetASTNode((MethodInvocation) pNode);
+        }
+        else if(pNode instanceof InfixExpression) {
+            return createTargetASTNode((InfixExpression) pNode);
+        }
+        else { // qualified name
+            return (Expression) ASTNode.copySubtree(this.tAST, pNode);
+        }
     }
 
     private MethodInvocation createTargetASTNode(MethodInvocation pNode) {
@@ -1146,7 +1205,7 @@ public class AUGFix {
         // receiver
         if(pNode.getExpression() != null) {
             Expression pExp = pNode.getExpression();
-            Expression tExp = buildTargetNode((Expression) pExp);
+            Expression tExp = createTargetASTNode((Expression) pExp);
             tNode.setExpression(tExp);
         }
         // method name
@@ -1157,7 +1216,7 @@ public class AUGFix {
             //TODO: need to consider when a method invocation is passed as an argument
             if(arg instanceof SimpleName) {
                 // get mapped var
-                SimpleName tVar = buildTargetNode((SimpleName) arg);
+                SimpleName tVar = createTargetASTNode((SimpleName) arg);
                 tNode.arguments().add(tVar);
             }
             else {
@@ -1333,6 +1392,31 @@ public class AUGFix {
         if(directCon == this.addedTargetNodes.get(cond)
                 || ((BaseNode) directCon).egroumNode.getSourceLineNumber() != ((BaseNode) this.addedTargetNodes.get(cond)).egroumNode.getSourceLineNumber())
             return true;
+        return false;
+    }
+
+    private boolean isInThenStmt(IfStatement ifStmt, ASTNode branchStmt) {
+        Statement thenStmt = ifStmt.getThenStatement();
+        if(thenStmt instanceof Block) {
+            if(findInBlock((Block) thenStmt, branchStmt)) return true;
+            else return false;
+        }
+        else { // then only a single stmt
+            if(thenStmt == branchStmt) return true;
+            else return false;
+        }
+    }
+
+    private boolean findInBlock(Block block, ASTNode target) {
+        for(Object stmt : block.statements()) {
+            if(stmt instanceof Block) {
+                if(findInBlock((Block) stmt, target)) return true;
+            }
+            else {
+                if(stmt == target) return true;
+            }
+            continue;
+        }
         return false;
     }
 }
