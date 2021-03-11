@@ -1,6 +1,7 @@
 package fix;
 
 import aug.model.*;
+import aug.model.actions.CatchNode;
 import aug.model.actions.InfixOperatorNode;
 import aug.model.actions.MethodCallNode;
 import aug.model.actions.NullCheckNode;
@@ -21,6 +22,7 @@ import edu.iastate.cs.egroum.aug.*;
 import org.eclipse.jdt.core.dom.*;
 import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
 
+import javax.xml.XMLConstants;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
@@ -31,7 +33,7 @@ import java.util.stream.Collectors;
 
 public class AUGFix {
     private static final Logger LOGGER = Logger.getLogger(AUGFix.class.getSimpleName());
-    private static final int MAX_FIX = 30;
+    private static final int MAX_FIX = 100;
 
     private final List<Violation> violations = new ArrayList<>();
     private List<CompilationUnit> fixedTargets = new ArrayList<>();
@@ -58,7 +60,21 @@ public class AUGFix {
     }
 
     public List<CompilationUnit> findFixes() {
-        for(int i=0; i<this.MAX_FIX; i++) {
+        for(int i=0; i<this.violations.size(); i++) {
+            String methodSig = this.violations.get(i).getOverlap().getTarget().getLocation().getMethodSignature();
+            String methodName = methodSig.substring(0, methodSig.indexOf('('));
+            /*
+            if(!methodName.equals("PdfPKCS7")
+                    && !methodName.equals("drawImage")
+                    && !methodName.equals("writeCrossReferenceTable")
+                    && !methodName.equals("addChild")
+                    && !methodName.equals("makeBookmarkParam")) {
+                continue;
+            }
+            if(methodName.equals("makeBookmarkParam")) {
+                int j=0;
+            }
+            */
             Violation aViolation = this.violations.get(i);
             CompilationUnit fixedTarget = findFix(aViolation);
             this.fixedTargets.add(fixedTarget);
@@ -229,7 +245,7 @@ public class AUGFix {
     }
 
     private Map<String, String> findVarMappings(Map<Node, Node> targetNodeByPatternNode) {
-        ASTNodeMapping astNodeMap = new ASTNodeMapping(targetNodeByPatternNode);
+        ASTNodeMapping astNodeMap = new ASTNodeMapping(targetNodeByPatternNode, this.anOverlap);
         astNodeMap.findVarMappings();
         return astNodeMap.targetVarByPatternVar;
     }
@@ -378,7 +394,7 @@ public class AUGFix {
         if(directCon != this.addedTargetNodes.get(tNode)) {
             return ;
         }
-        this.addedNodesToBeDeleted.add(this.addedTargetNodes.inverse().get(directCon));
+        //this.addedNodesToBeDeleted.add(this.addedTargetNodes.inverse().get(this.addedTargetNodes.get(tNode)));
         // 创建新条件
         Expression newCon = (Expression) this.addedTargetNodes.inverse().get(directCon);
         // 首先判断函数返回类型
@@ -411,6 +427,17 @@ public class AUGFix {
             }
         }
         if(mappedNode != null) {
+            // 找到最近的mappedNode
+            Node nearestMapped = findNearestMappedNode(this.addedTargetNodes.get(tNode));
+            for(Node key: this.anOverlap.getTargetNodeByPatternNode().keySet()) {
+                if(this.anOverlap.getMappedTargetNode(key) == nearestMapped) {
+                    nearestMapped = key;
+                    break;
+                }
+            }
+            if( getEGroumId(nearestMapped) > getEGroumId(this.addedTargetNodes.get(tNode)) ) {
+                mappedNode = nearestMapped;
+            }
             // 找到该匹配语句的所在block
             Node targetNode = this.anOverlap.getMappedTargetNode(mappedNode);
             ASTNode originBlock = null, mappedStmt = null;
@@ -431,12 +458,22 @@ public class AUGFix {
                 mappedStmt = mappedStmt.getParent();
             }
             originBlock = mappedStmt.getParent();
+            if(originBlock instanceof IfStatement) {
+                Block newIfBlock = this.tAST.newBlock();
+                if(((IfStatement) originBlock).getThenStatement() == mappedStmt)
+                    ((IfStatement) originBlock).setThenStatement(newIfBlock);
+                else
+                    ((IfStatement) originBlock).setElseStatement(newIfBlock);
+                newIfBlock.statements().add(mappedStmt);
+                originBlock = newIfBlock;
+            }
             int mappedIndex = ((Block) originBlock).statements().indexOf(mappedStmt);
             // 如果是构造函数
             if(returnType.equals("isConstructor")) {
                 // 如果T分支内存在已匹配的语句，那么if括住它之后的所有语句
                 IfStatement newIfStmt = this.tAST.newIfStatement();
                 newIfStmt.setExpression(newCon);
+                this.addedNodesToBeDeleted.add(this.addedTargetNodes.inverse().get(this.addedTargetNodes.get(tNode)));
                 Block newIfBody = this.tAST.newBlock();
                 Iterator stmtIt = ((Block) originBlock).statements().subList(mappedIndex, ((Block) originBlock).statements().size() - 1).iterator();
                 while (stmtIt.hasNext()) {
@@ -451,10 +488,13 @@ public class AUGFix {
             else {
                 // 如果pattern中if控制的T分支的第一个节点未匹配那么先创建这个节点再插入if
                 IfStatement newIfStmt = this.tAST.newIfStatement();
+                ParenthesizedExpression parenthesizedExp = this.tAST.newParenthesizedExpression();
+                parenthesizedExp.setExpression(newCon);
                 PrefixExpression rltExp = this.tAST.newPrefixExpression(); // if-exp is (!condition)
                 rltExp.setOperator(PrefixExpression.Operator.NOT);
-                rltExp.setOperand(newCon);
+                rltExp.setOperand(parenthesizedExp);
                 newIfStmt.setExpression(rltExp);
+                this.addedNodesToBeDeleted.add(this.addedTargetNodes.inverse().get(this.addedTargetNodes.get(tNode)));
                 Block newIfBody = this.tAST.newBlock(); // then-body
                 newIfStmt.setThenStatement(newIfBody);
                 ReturnStatement defaultReturn = createDefaultReturn(returnType);
@@ -465,10 +505,12 @@ public class AUGFix {
             }
         }
         // 如果不存在已匹配的，那么跳过此节点，先创建这些分支内的节点再回来创建if
+        /*
         else {
             this.addedNodesToBeDeleted.remove(this.addedTargetNodes.inverse().get(directCon));
             return ;
         }
+        */
     }
 
     private void insertAsLoop(ASTNode tNode) {
@@ -530,14 +572,20 @@ public class AUGFix {
             InfixExpression rltExp = this.tAST.newInfixExpression();
             rltExp.setOperator(InfixExpression.Operator.CONDITIONAL_AND);
             // right operand
-            rltExp.setRightOperand(newCon);
+            ParenthesizedExpression parenthesizedExp1 = this.tAST.newParenthesizedExpression();
+            parenthesizedExp1.setExpression(newCon);
+            rltExp.setRightOperand(parenthesizedExp1);
             // left operand
             if(cursor instanceof WhileStatement) {
                 Expression lExp = (Expression) ASTNode.copySubtree(this.tAST, ((WhileStatement) cursor).getExpression());
-                rltExp.setLeftOperand(lExp);
+                ParenthesizedExpression parenthesizedExp0 = this.tAST.newParenthesizedExpression();
+                parenthesizedExp0.setExpression(lExp);
+                rltExp.setLeftOperand(parenthesizedExp0);
             }
             else if(cursor instanceof ForStatement) {
                 Expression lExp = (Expression) ASTNode.copySubtree(this.tAST, ((ForStatement) cursor).getExpression());
+                ParenthesizedExpression parenthesizedExp0 = this.tAST.newParenthesizedExpression();
+                parenthesizedExp0.setExpression(lExp);
                 rltExp.setLeftOperand(lExp);
             }
             ((WhileStatement) cursor).setExpression(rltExp);
@@ -618,7 +666,9 @@ public class AUGFix {
                     IfStatement newIfStmt = this.tAST.newIfStatement();
                     PrefixExpression rltExp = this.tAST.newPrefixExpression(); // if-exp is (!condition)
                     rltExp.setOperator(PrefixExpression.Operator.NOT);
-                    rltExp.setOperand(newCon);
+                    ParenthesizedExpression parenthesizedExp = this.tAST.newParenthesizedExpression();
+                    parenthesizedExp.setExpression(newCon);
+                    rltExp.setOperand(parenthesizedExp);
                     newIfStmt.setExpression(rltExp);
                     Block newIfBody = this.tAST.newBlock(); // then-body
                     newIfStmt.setThenStatement(newIfBody);
@@ -815,7 +865,7 @@ public class AUGFix {
                 break;
             }
         }
-        // 首先判断是否已存在Finally结构
+        // 首先判断是否已存在Finally结构，先检查是否存在匹配的finally块中的节点
         Node fsource = fedge.getSource();
         Node mappedfNode = null;
         List<Node> finallyNodes = new ArrayList<>();
@@ -831,10 +881,32 @@ public class AUGFix {
                 finallyNodes.add(oedge.getTarget());
             }
         }
+        // 再检查匹配的try块内的节点
+        Block finallyBlock = null;
+        if(mappedfNode == null) {
+            Node ftarget0 = fedge.getTarget();
+            for(Edge iedge : this.aPattern.incomingEdgesOf(ftarget0)) {
+                if(iedge instanceof FinallyEdge) {
+                    if(!this.missingNodes.contains(iedge.getSource())) {
+                        ASTNode cursor = findNearestBlock(iedge.getSource());
+                        while(!(cursor instanceof TryStatement)
+                                && !(cursor instanceof MethodDeclaration)) {
+                            cursor = cursor.getParent();
+                        }
+                        if(cursor instanceof TryStatement) {
+                            if(((TryStatement) cursor).getFinally() != null) {
+                                mappedfNode = iedge.getSource();
+                                finallyBlock =  ((TryStatement) cursor).getFinally();
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // 若存在finally结构
         if(mappedfNode != null) {
             // 找到最近的该finallyBlock
-            Block finallyBlock = findNearestBlock(mappedfNode);
+            finallyBlock = finallyBlock == null ? findNearestBlock(mappedfNode) : finallyBlock;
             // 把pattern的finally中所有语句按id从小到大排序
             finallyNodes.sort(new Comparator<Node>() {
                 @Override
@@ -1148,6 +1220,27 @@ public class AUGFix {
         String tRecv = "";
         try {
             tRecv = findMappedVar(pRecv);
+            // receiver是methodcall
+            if(tRecv.startsWith("dummy")) {
+                for(Node anode : this.anOverlap.getTargetNodeByPatternNode().keySet()) {
+                    if(anode instanceof ActionNode)
+                        continue;
+                    if(((DataNode) this.anOverlap.getMappedTargetNode(anode)).getName().equals(tRecv)) {
+                        // anode是receiver
+                        for(Edge edge : this.aPattern.outgoingEdgesOf(anode)) {
+                            if(edge instanceof ReceiverEdge && !this.missingNodes.contains(edge.getTarget())) {
+                                ASTNode receiver = ((MethodInvocation) ((BaseNode) this.anOverlap.getMappedTargetNode(edge.getTarget()))
+                                        .egroumNode.getAstNode()).getExpression();
+                                ASTNode newReceiver = ASTNode.copySubtree(this.tAST, receiver);
+                                tNode.setExpression((Expression) newReceiver);
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+
+            }
             if(tRecv.equals("NOTEXIST")) {
                 throw new IllegalArgumentException();
             }
@@ -1166,24 +1259,45 @@ public class AUGFix {
                 tNode.setExpression(name);
             }
             else {
-                SimpleName tRecvNode = this.tAST.newSimpleName(tRecv);
-                tNode.setExpression(tRecvNode);
+                if(!tRecv.startsWith("dummy")) {
+                    SimpleName tRecvNode = this.tAST.newSimpleName(tRecv);
+                    tNode.setExpression(tRecvNode);
+                }
             }
             return tNode;
         }
     }
 
-    private SimpleName createTargetASTNode(SimpleName pNode) {
+    private ASTNode createTargetASTNode(SimpleName pNode) {
         String pVar = pNode.getIdentifier();
         // get mapped
         String tVar = findMappedVar(pVar);
-        SimpleName tNode = this.tAST.newSimpleName(tVar);
+        ASTNode tNode;
+        if(tVar.startsWith("dummy")) {
+            for(Node anode : this.anOverlap.getTargetNodeByPatternNode().keySet()) {
+                if(anode instanceof ActionNode)
+                    continue;
+                if(((DataNode) this.anOverlap.getMappedTargetNode(anode)).getName().equals(tVar)) {
+                    // anode是receiver
+                    for(Edge edge : this.aPattern.outgoingEdgesOf(anode)) {
+                        if(edge instanceof ReceiverEdge && !this.missingNodes.contains(edge.getTarget())) {
+                            ASTNode receiver = ((MethodInvocation) ((BaseNode) this.anOverlap.getMappedTargetNode(edge.getTarget()))
+                                    .egroumNode.getAstNode()).getExpression();
+                            tNode = ASTNode.copySubtree(this.tAST, receiver);
+                            return tNode;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        tNode = this.tAST.newSimpleName(tVar);
         return tNode;
     }
 
     private Expression createTargetASTNode(Expression pNode) {
         if(pNode instanceof SimpleName) { // single var
-            return createTargetASTNode((SimpleName) pNode);
+            return (Expression) createTargetASTNode((SimpleName) pNode);
         }
         //TODO: also need to consider when expression is a method invocation
         else if(pNode instanceof ClassInstanceCreation) {
@@ -1216,7 +1330,7 @@ public class AUGFix {
             //TODO: need to consider when a method invocation is passed as an argument
             if(arg instanceof SimpleName) {
                 // get mapped var
-                SimpleName tVar = createTargetASTNode((SimpleName) arg);
+                SimpleName tVar = (SimpleName) createTargetASTNode((SimpleName) arg);
                 tNode.arguments().add(tVar);
             }
             else {
@@ -1251,6 +1365,7 @@ public class AUGFix {
                             tVar = ((DataNode) tVarNode).getName();
                             if(tVar.equals("dummy_"))
                                 tVar += "new" + this.newVarId++;
+                            ((DataNode) tVarNode).setName(tVar);
                             this.targetVarByPattern.put(pVar, tVar);
                             return tVar;
                         }
