@@ -1,8 +1,9 @@
 package fix;
 
-import aug.model.ActionNode;
-import aug.model.BaseNode;
-import aug.model.Node;
+import aug.model.*;
+import aug.model.dataflow.DefinitionEdge;
+import aug.model.patterns.APIUsagePattern;
+import de.tu_darmstadt.stg.mudetect.model.Overlap;
 import org.eclipse.jdt.core.dom.ASTNode;
 import org.eclipse.jdt.core.dom.MethodInvocation;
 import org.eclipse.jdt.core.dom.SimpleName;
@@ -14,12 +15,16 @@ public class ASTNodeMapping {
     public Map<ASTNode, ASTNode> targetASTNodeByPatternASTNode = new HashMap<>();
     public Map<String, String> targetVarByPatternVar = new HashMap<>();
     private Map<Node, Node> targetNodeByPatternNode;
+    private Overlap overlap;
 
-    public ASTNodeMapping(Map<Node, Node> targetByPattern) {
+    public ASTNodeMapping(Map<Node, Node> targetByPattern, Overlap overlap) {
         this.targetNodeByPatternNode = targetByPattern;
+        this.overlap = overlap;
     }
 
     public void findVarMappings() {
+        APIUsagePattern pattern = this.overlap.getPattern();
+        APIUsageExample target = this.overlap.getTarget();
         for(Map.Entry<Node, Node> entry : targetNodeByPatternNode.entrySet()) {
             Node pNode = entry.getKey(), tNode = entry.getValue();
             // focus on action node, skip data node
