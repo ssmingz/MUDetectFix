@@ -1,13 +1,11 @@
 package fix;
 
 import aug.model.*;
-import aug.model.actions.CatchNode;
 import aug.model.actions.InfixOperatorNode;
 import aug.model.actions.MethodCallNode;
 import aug.model.actions.NullCheckNode;
 import aug.model.controlflow.*;
 import aug.model.data.LiteralNode;
-import aug.model.data.VariableNode;
 import aug.model.dataflow.DefinitionEdge;
 import aug.model.dataflow.ParameterEdge;
 import aug.model.dataflow.ReceiverEdge;
@@ -15,25 +13,23 @@ import aug.model.patterns.APIUsagePattern;
 import aug.model.patterns.AggregateDataNode;
 import com.google.common.collect.BiMap;
 import com.google.common.collect.HashBiMap;
-import com.google.common.collect.Multiset;
 import de.tu_darmstadt.stg.mudetect.model.Overlap;
 import de.tu_darmstadt.stg.mudetect.model.Violation;
 import edu.iastate.cs.egroum.aug.*;
 import org.eclipse.jdt.core.dom.*;
-import org.eclipse.jdt.internal.compiler.lookup.TypeBinding;
 
-import javax.xml.XMLConstants;
 import java.io.File;
-import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.*;
 import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 public class AUGFix {
     private static final Logger LOGGER = Logger.getLogger(AUGFix.class.getSimpleName());
-    private static final int MAX_FIX = 100;
+    private static final int MAX_FIX = 500;
 
     private final List<Violation> violations = new ArrayList<>();
     private List<CompilationUnit> fixedTargets = new ArrayList<>();
@@ -45,9 +41,12 @@ public class AUGFix {
     private APIUsagePattern aPattern;
     private APIUsageExample aTarget;
     private CompilationUnit fixedTarget, targetRefer;
+    private MethodDeclaration md = null;
     private List<Node> missingNodes;
-    private BiMap<ASTNode, Node> addedTargetNodes = HashBiMap.create();
+    private BiMap<ASTNode, Node> addedTargetNodes = HashBiMap.create(), addedTargetNodes_ref = HashBiMap.create();
     private Set<ASTNode> addedNodesToBeDeleted = new HashSet<>();
+
+    private Map<Statement, DefUseInfo> defUseInfoMap = new LinkedHashMap<>();
 
     private int violationId = 0;
     private int newVarId, mistakeId;
@@ -60,7 +59,7 @@ public class AUGFix {
     }
 
     public List<CompilationUnit> findFixes() {
-        for(int i=0; i<this.violations.size(); i++) {
+        for(int i=0; i<this.violations.size() && i<MAX_FIX; i++) {
             String methodSig = this.violations.get(i).getOverlap().getTarget().getLocation().getMethodSignature();
             String methodName = methodSig.substring(0, methodSig.indexOf('('));
             /*
@@ -75,6 +74,15 @@ public class AUGFix {
                 int j=0;
             }
             */
+
+            if(!methodName.equals("PdfPKCS7")
+                    && !methodName.equals("drawImage")
+                    && !methodName.equals("writeCrossReferenceTable")
+                    && !methodName.equals("addChild")
+                    && !methodName.equals("makeBookmarkParam")) {
+                continue;
+            }
+
             Violation aViolation = this.violations.get(i);
             CompilationUnit fixedTarget = findFix(aViolation);
             this.fixedTargets.add(fixedTarget);
@@ -91,6 +99,24 @@ public class AUGFix {
         this.newVarId = 0;
         this.mistakeId = -1;
         initialReferenceTarget();
+
+        // Step0 : Get def-use info for each statement in target
+        this.defUseInfoMap.clear();
+        String methodSig = this.aTarget.getLocation().getMethodSignature();
+        String methodName = methodSig.substring(0, methodSig.indexOf('('));
+        for(Node tNode : this.anOverlap.getMappedTargetNodes()) {
+            ASTNode tASTNode = ((BaseNode) tNode).egroumNode.getAstNode();
+            if(tASTNode != null) {
+                while(!(tASTNode instanceof MethodDeclaration)) {
+                    tASTNode = tASTNode.getParent();
+                }
+                this.md = (MethodDeclaration) tASTNode;
+                break;
+            }
+        }
+        for(Object stmt : this.md.getBody().statements()) {
+            this.defUseInfoMap.putAll(findDefUseInfo((Statement) stmt, this.md)); //findDefUseInfo((Statement) stmt, this.md);
+        }
 
         // Step1 : Find variable ASTNode mappings between target and pattern
         this.targetVarByPattern = findVarMappings(this.anOverlap.getTargetNodeByPatternNode());
@@ -165,6 +191,7 @@ public class AUGFix {
         // traverse and build ASTNode
         // recorded in map { astNode (to be added) : patternAUGNode (used to get position) }
         this.addedTargetNodes.clear();
+        this.addedTargetNodes_ref.clear();
         this.addedNodesToBeDeleted.clear();
         for(Node mNode : this.missingNodes) {
             this.addedTargetNodes.put(buildTargetNode(mNode), mNode);
@@ -180,11 +207,20 @@ public class AUGFix {
         }
         // Step3 : Insert new astNodes to fixedTarget
         Set<Edge> missingEdges = this.anOverlap.getMissingEdges();
+        this.addedTargetNodes_ref.putAll(this.addedTargetNodes); // copy to reference
         Iterator nodeIt = this.addedTargetNodes.keySet().iterator();
         while(nodeIt.hasNext()) {
             ASTNode iNode = (ASTNode) nodeIt.next();
             if(this.addedNodesToBeDeleted.contains(iNode)) continue;
             insertNewASTNode(iNode);
+            ASTNode cursor = iNode;
+            while(!(cursor instanceof Statement) && cursor != null) {
+                cursor = cursor.getParent();
+            }
+            if(cursor == null) continue;
+            findDefUseInfo((Statement) cursor, md);
+            if(!this.addedNodesToBeDeleted.contains(iNode))
+                nodeIt.remove();
         }
         Set<ASTNode> restNodes = this.addedTargetNodes.keySet().stream()
                 .filter(p -> !this.addedNodesToBeDeleted.contains(p)).collect(Collectors.toSet());
@@ -192,6 +228,12 @@ public class AUGFix {
         while(nodeIt.hasNext()) {
             ASTNode iNode = (ASTNode) nodeIt.next();
             insertNewASTNode(iNode);
+            ASTNode cursor = iNode;
+            while(!(cursor instanceof Statement) && cursor != null) {
+                cursor = cursor.getParent();
+            }
+            if(cursor == null) continue;
+            findDefUseInfo((Statement) cursor, md);
         }
         if(mistakeId == -1) {
             logPrefix += "Successfully fix in Violation#";
@@ -268,6 +310,16 @@ public class AUGFix {
                 return ;
             }
         }
+        // replace NOTEXIST declaration
+        if(tNode instanceof Assignment && ((Assignment) tNode).getLeftHandSide().toString().equals("NOTEXIST")) {
+            for(ASTNode astnode : this.addedTargetNodes.keySet()) {
+                replaceNOTEXIST(astnode, (Assignment) tNode);
+            }
+            for(ASTNode astnode : this.addedNodesToBeDeleted) {
+                replaceNOTEXIST(astnode, (Assignment) tNode);
+            }
+            return;
+        }
         // 第二种情况：缺少判断条件
         Iterator oedgeIt = this.aPattern.outgoingEdgesOf(this.addedTargetNodes.get(tNode)).iterator();
         while(oedgeIt.hasNext()) {
@@ -285,7 +337,20 @@ public class AUGFix {
         }
         // 第三种情况：单纯地缺少语句
         insertSimpleStmt(tNode);
-        this.addedNodesToBeDeleted.add(tNode);
+        //this.addedNodesToBeDeleted.add(tNode); // move this step into insertSimpleStmt() method
+    }
+
+    private void replaceNOTEXIST(ASTNode target, Assignment neAssign) {
+        if(target instanceof InfixExpression) {
+            // replace left
+            if(((InfixExpression) target).getLeftOperand().toString().equals("NOTEXIST")) {
+                ((InfixExpression) target).setLeftOperand((Expression) ASTNode.copySubtree(this.tAST, neAssign.getRightHandSide()));
+            }
+            // or replace right
+            else if(((InfixExpression) target).getRightOperand().toString().equals("NOTEXIST")) {
+                ((InfixExpression) target).setRightOperand((Expression) ASTNode.copySubtree(this.tAST, neAssign.getRightHandSide()));
+            }
+        }
     }
 
     private void insertSimpleStmt(ASTNode tNode) {
@@ -294,6 +359,10 @@ public class AUGFix {
         // 直接找到最近一个匹配的节点然后插入
         Node pNode = this.addedTargetNodes.get(tNode);
         Node mappedNode = findNearestMappedNode(pNode);
+        // 默认如果未找到匹配节点直接跳过
+        if(mappedNode == null) {
+            return;
+        }
         // 找到已匹配节点所在block
         ASTNode originBlock = null, mappedStmt = null;
         if(!this.missingNodes.contains(mappedNode)) {
@@ -301,10 +370,13 @@ public class AUGFix {
             mappedStmt = ((BaseNode) mappedNode).egroumNode.getAstNode();
         }
         else {
-            originBlock = this.addedTargetNodes.inverse().get(mappedNode);
-            mappedStmt = this.addedTargetNodes.inverse().get(mappedNode);
+            originBlock = this.addedTargetNodes_ref.inverse().get(mappedNode);
+            mappedStmt = this.addedTargetNodes_ref.inverse().get(mappedNode);
         }
         while(!(mappedStmt instanceof Statement)) {
+            if(mappedStmt==null) {
+                int i=1;
+            }
             mappedStmt = mappedStmt.getParent();
         }
         originBlock = mappedStmt.getParent();
@@ -325,13 +397,71 @@ public class AUGFix {
                 originBlock = newBlock;
             }
         }
-        int mappedIndex = ((Block) originBlock).statements().indexOf(mappedStmt);
+        int mappedIndex;
+        List<ASTNode> statements;
+        if(originBlock instanceof SwitchStatement) {
+            statements = ((SwitchStatement) originBlock).statements();
+        }
+        else {
+            statements = ((Block) originBlock).statements();
+        }
+        mappedIndex = statements.indexOf(mappedStmt);
         // 该已匹配节点在待插入节点的前面，则在其之后插入
-        if(getEGroumId(mappedNode) < getEGroumId(pNode))
-            ((Block) originBlock).statements().add(mappedIndex+1, newStmt);
+        if(getEGroumId(mappedNode) < getEGroumId(pNode)) {
+            // filter part
+            Map<Statement, DefUseInfo> newInsert = findDefUseInfo(newStmt, this.md);
+            Set<String> newDef = newInsert.get(newStmt).def;
+            boolean isMeaningful = false, findMapped = false;
+            for(Map.Entry<Statement, DefUseInfo> entry : this.defUseInfoMap.entrySet()) {
+                if(entry.getKey() == statements.get(mappedIndex+1)) {
+                    findMapped = true;
+                }
+                if(findMapped) {
+                    Set<String> originUse = entry.getValue().use;
+                    for(String def : newDef) {
+                        if(originUse.contains(def)) {
+                            isMeaningful = true;
+                            break;
+                        }
+                    }
+                }
+                if(isMeaningful) {
+                    break;
+                }
+            }
+            if(isMeaningful) {
+                statements.add(mappedIndex + 1, newStmt);
+                this.addedNodesToBeDeleted.add(tNode);
+            }
+        }
         // 在后面，则在其之前插入
-        else
-            ((Block) originBlock).statements().add(mappedIndex, newStmt);
+        else {
+            // filter part
+            Map<Statement, DefUseInfo> newInsert = findDefUseInfo(newStmt, this.md);
+            Set<String> newDef = newInsert.get(newStmt).def;
+            boolean isMeaningful = false, findMapped = false;
+            for(Map.Entry<Statement, DefUseInfo> entry : this.defUseInfoMap.entrySet()) {
+                if(entry.getKey() == statements.get(mappedIndex)) {
+                    findMapped = true;
+                }
+                if(findMapped) {
+                    Set<String> originUse = entry.getValue().use;
+                    for(String def : newDef) {
+                        if(originUse.contains(def)) {
+                            isMeaningful = true;
+                            break;
+                        }
+                    }
+                }
+                if(isMeaningful) {
+                    break;
+                }
+            }
+            if(isMeaningful) {
+                statements.add(mappedIndex, newStmt);
+                this.addedNodesToBeDeleted.add(tNode);
+            }
+        }
     }
 
     /*
@@ -342,7 +472,7 @@ public class AUGFix {
         int minDist1 = Integer.MAX_VALUE, minDist2 = Integer.MAX_VALUE;
         // 检查原有的
         for(Node node : this.anOverlap.getTargetNodeByPatternNode().keySet()) { // traverse mapped pattern nodes
-            if(node instanceof ActionNode) {
+            if(node instanceof ActionNode && !this.missingNodes.contains(node)) {
                 int dist = Math.abs(getEGroumId(pNode) - getEGroumId(node));
                 if(dist<minDist1) {
                     minDist1 = dist;
@@ -394,9 +524,9 @@ public class AUGFix {
         if(directCon != this.addedTargetNodes.get(tNode)) {
             return ;
         }
-        //this.addedNodesToBeDeleted.add(this.addedTargetNodes.inverse().get(this.addedTargetNodes.get(tNode)));
+        //this.addedNodesToBeDeleted.add(this.addedTargetNodes_ref.inverse().get(this.addedTargetNodes.get(tNode)));
         // 创建新条件
-        Expression newCon = (Expression) this.addedTargetNodes.inverse().get(directCon);
+        Expression newCon = (Expression) addedTargetNodes_ref.inverse().get(directCon);
         // 首先判断函数返回类型
         String returnType = getReturnType(this.aTarget);
         // 找到原条件控制的T分支的所有节点
@@ -421,7 +551,7 @@ public class AUGFix {
             // 所有节点分为missing和mapped两类，this.missingNodes在两类都有涉及，实际匹配的是mapped中去除this.missingNodes的
             if ( (this.anOverlap.getTargetNodeByPatternNode().keySet().contains(node)
                     && !this.missingNodes.contains(node))
-                    || this.addedNodesToBeDeleted.contains(this.addedTargetNodes.inverse().get(node))) {
+                    || this.addedNodesToBeDeleted.contains(this.addedTargetNodes_ref.inverse().get(node))) {
                 mappedNode = node;
                 break;
             }
@@ -451,8 +581,8 @@ public class AUGFix {
                 }
             }
             else {
-                originBlock = this.addedTargetNodes.inverse().get(mappedNode);
-                mappedStmt = this.addedTargetNodes.inverse().get(mappedNode);
+                originBlock = this.addedTargetNodes_ref.inverse().get(mappedNode);
+                mappedStmt = this.addedTargetNodes_ref.inverse().get(mappedNode);
             }
             while (!(mappedStmt instanceof Statement)) {
                 mappedStmt = mappedStmt.getParent();
@@ -467,21 +597,40 @@ public class AUGFix {
                 newIfBlock.statements().add(mappedStmt);
                 originBlock = newIfBlock;
             }
-            int mappedIndex = ((Block) originBlock).statements().indexOf(mappedStmt);
+            int mappedIndex;
+            List<ASTNode> statements;
+            if(originBlock instanceof SwitchStatement) {
+                statements = ((SwitchStatement) originBlock).statements();
+            }
+            else {
+                statements = ((Block) originBlock).statements();
+            }
+            mappedIndex = statements.indexOf(mappedStmt);
+            // find T branch nodes in target
+            Set<Statement> targetTBranch = getBranchStatements(tBranchNodes);
             // 如果是构造函数
             if(returnType.equals("isConstructor")) {
                 // 如果T分支内存在已匹配的语句，那么if括住它之后的所有语句
                 IfStatement newIfStmt = this.tAST.newIfStatement();
                 newIfStmt.setExpression(newCon);
-                this.addedNodesToBeDeleted.add(this.addedTargetNodes.inverse().get(this.addedTargetNodes.get(tNode)));
+                this.addedNodesToBeDeleted.add(this.addedTargetNodes_ref.inverse().get(this.addedTargetNodes.get(tNode)));
                 Block newIfBody = this.tAST.newBlock();
-                Iterator stmtIt = ((Block) originBlock).statements().subList(mappedIndex, ((Block) originBlock).statements().size() - 1).iterator();
+                Block newElseBody = this.tAST.newBlock();
+                // find statements irrelevant to pattern-then-stmts in target
+                Set<Statement> newElseBlock = findIrrelevantStmts(targetTBranch, (Statement) mappedStmt);
+                newIfStmt.setThenStatement(newIfBody);
+                newIfStmt.setElseStatement(newElseBody);
+                Iterator stmtIt = statements.subList(mappedIndex, ((Block) originBlock).statements().size() - 1).iterator();
                 while (stmtIt.hasNext()) {
                     Statement stmt = (Statement) stmtIt.next();
-                    stmtIt.remove();
+                    stmt.delete();
                     newIfBody.statements().add(stmt);
                 }
-                ((Block) originBlock).statements().add(newIfStmt);
+                for(Statement stmt : newElseBlock) {
+                    Statement newStmt = (Statement) ASTNode.copySubtree(this.tAST, stmt);
+                    newElseBody.statements().add(newStmt);
+                }
+                statements.add(newIfStmt);
                 return ;
             }
             // 如果不是构造函数
@@ -494,23 +643,130 @@ public class AUGFix {
                 rltExp.setOperator(PrefixExpression.Operator.NOT);
                 rltExp.setOperand(parenthesizedExp);
                 newIfStmt.setExpression(rltExp);
-                this.addedNodesToBeDeleted.add(this.addedTargetNodes.inverse().get(this.addedTargetNodes.get(tNode)));
+                this.addedNodesToBeDeleted.add(this.addedTargetNodes_ref.inverse().get(this.addedTargetNodes.get(tNode)));
                 Block newIfBody = this.tAST.newBlock(); // then-body
+                // find statements irrelevant to pattern-then-stmts in target
+                Set<Statement> newThenBlock = findIrrelevantStmts(targetTBranch, (Statement) mappedStmt);
                 newIfStmt.setThenStatement(newIfBody);
-                ReturnStatement defaultReturn = createDefaultReturn(returnType);
-                newIfBody.statements().add(defaultReturn);
+                for(Statement stmt : newThenBlock) {
+                    //stmt.delete();
+                    Statement newStmt = (Statement) ASTNode.copySubtree(this.tAST, stmt);
+                    newIfBody.statements().add(newStmt);
+                }
+                int newIfBodySize = newIfBody.statements().size();
+                if((newIfBodySize > 0 && !(newIfBody.statements().get(newIfBodySize-1) instanceof ReturnStatement))
+                        || newIfBodySize == 0) {
+                    ReturnStatement defaultReturn = createDefaultReturn(returnType);
+                    newIfBody.statements().add(defaultReturn);
+                }
                 // insert if stmt
-                ((Block) originBlock).statements().add(mappedIndex, newIfStmt);
+                statements.add(mappedIndex, newIfStmt);
+                // update defUseInfoMap
+                updateDefUseInfo(newIfStmt, this.md, mappedStmt);
                 return ;
             }
         }
         // 如果不存在已匹配的，那么跳过此节点，先创建这些分支内的节点再回来创建if
         /*
         else {
-            this.addedNodesToBeDeleted.remove(this.addedTargetNodes.inverse().get(directCon));
+            this.addedNodesToBeDeleted.remove(this.addedTargetNodes_ref.inverse().get(directCon));
             return ;
         }
         */
+    }
+
+    private void updateDefUseInfo(Statement newStmt, MethodDeclaration methodDecl, ASTNode mappedStmt) {
+        Map<Statement, DefUseInfo> result = new LinkedHashMap<>();
+        Map<Statement, DefUseInfo> newPart = findDefUseInfo(newStmt, methodDecl);
+        for(Map.Entry<Statement, DefUseInfo> entry : this.defUseInfoMap.entrySet()) {
+            if(entry.getKey() == mappedStmt) {
+                result.putAll(newPart);
+            }
+            result.put(entry.getKey(), entry.getValue());
+        }
+        this.defUseInfoMap.clear();
+        this.defUseInfoMap.putAll(result);
+    }
+
+    private Set<Statement> findIrrelevantStmts(Set<Statement> targetTBranch, Statement insertPos) {
+        Set<Statement> irrelevantStmts = new LinkedHashSet<>();
+        // first get set D (all defs in targetTBranch)
+        Set<String> defs = new HashSet<>();
+        for(Statement stmt : targetTBranch) {
+            defs.addAll(this.defUseInfoMap.get(stmt).def);
+        }
+        // then check each statement after the target insert position, be irrelevant if its use doesn't intersect with D
+        boolean flag = false;
+        Set<String> preUse = new LinkedHashSet<>();
+        for(Map.Entry<Statement, DefUseInfo> entry: this.defUseInfoMap.entrySet()) {
+            if(entry.getKey() == insertPos) {
+                flag = true;
+                if(entry.getKey() instanceof IfStatement || entry.getKey() instanceof WhileStatement)
+                    preUse.addAll(entry.getValue().use);
+                continue;
+            }
+            if(flag == false) continue;
+            boolean canBeAdded = true;
+            for(String use : entry.getValue().use) {
+                if(defs.contains(use) || (preUse.size()>0 && preUse.contains(use))) { // statement can be added condition 1: don't use any def
+                    canBeAdded = false;
+                    break;
+                }
+                else {
+                    ASTNode cursor = entry.getKey();
+                    boolean repeat = false;
+                    while(!(cursor instanceof MethodDeclaration)) { // condition 2: not child of any added stmt
+                        if(irrelevantStmts.contains(cursor)) {
+                            repeat = true;
+                            break;
+                        }
+                        cursor = cursor.getParent();
+                    }
+                    if(repeat) {
+                        canBeAdded = false;
+                        break;
+                    }
+                }
+            }
+            if(canBeAdded) {
+                if(entry.getKey() instanceof Block) {
+                    irrelevantStmts.addAll(((Block) entry.getKey()).statements());
+                    int size = ((Block) entry.getKey()).statements().size();
+                    if(((Block) entry.getKey()).statements().get(size-1) instanceof ReturnStatement)
+                        break;
+                }
+                else {
+                    irrelevantStmts.add(entry.getKey());
+                    if(entry.getKey() instanceof ReturnStatement)
+                        break;
+                }
+            }
+        }
+        return irrelevantStmts;
+    }
+
+    private Set<Statement> getBranchStatements(List<Node> tBranchNodes) {
+        Set<Statement> targetBranch = new LinkedHashSet<>();
+        for(Node pNode : tBranchNodes) {
+            if(!this.anOverlap.getMissingNodes().contains(pNode)) { // mapped
+                Node tNode = this.anOverlap.getMappedTargetNode(pNode);
+                ASTNode tASTNode = ((BaseNode) tNode).egroumNode.getAstNode();
+                if(tASTNode != null) {
+                    while(!(tASTNode instanceof Statement)) {
+                        tASTNode = tASTNode.getParent();
+                    }
+                    targetBranch.add((Statement) tASTNode);
+                }
+            }
+            else if(this.addedNodesToBeDeleted.contains(this.addedTargetNodes_ref.inverse().get(pNode))) {
+                ASTNode tASTNode = this.addedTargetNodes_ref.inverse().get(pNode);
+                while(!(tASTNode instanceof Statement)) {
+                    tASTNode = tASTNode.getParent();
+                }
+                targetBranch.add((Statement) tASTNode);
+            }
+        }
+        return targetBranch;
     }
 
     private void insertAsLoop(ASTNode tNode) {
@@ -540,21 +796,21 @@ public class AUGFix {
         if(directCon != this.addedTargetNodes.get(tNode)) {
             return ;
         }
-        this.addedNodesToBeDeleted.add(this.addedTargetNodes.inverse().get(directCon));
+        //this.addedNodesToBeDeleted.add(this.addedTargetNodes_ref.inverse().get(directCon));
         // 检查rep边的终点所在结构是什么
         boolean isInLoop = false;
         ASTNode cursor = null; //表示target中的
         for(Edge oedge : this.aPattern.outgoingEdgesOf(cedge.getSource())) {
             if(oedge instanceof RepetitionEdge) {
                 if(!this.missingNodes.contains(oedge.getTarget())
-                        || this.addedNodesToBeDeleted.contains(oedge.getTarget())) {
+                        || this.addedNodesToBeDeleted.contains(this.addedTargetNodes_ref.inverse().get(oedge.getTarget()))) {
                     Node targetNode = this.anOverlap.getMappedTargetNode(oedge.getTarget());
                     if(targetNode != null)
                         cursor = ((BaseNode) targetNode).egroumNode.getAstNode();
                     else
-                        cursor = this.addedTargetNodes.inverse().get(oedge.getTarget());
+                        cursor = this.addedTargetNodes_ref.inverse().get(oedge.getTarget());
                     if(cursor != null) {
-                        while(!(cursor instanceof WhileStatement) || !(cursor instanceof ForStatement)) {
+                        while(!(cursor instanceof WhileStatement) && !(cursor instanceof ForStatement) && cursor != null) {
                             cursor = cursor.getParent();
                             if(cursor instanceof MethodDeclaration) break;
                         }
@@ -565,7 +821,7 @@ public class AUGFix {
             }
         }
         // 创建新条件
-        Expression newCon = (Expression) this.addedTargetNodes.inverse().get(directCon);
+        Expression newCon = (Expression) this.addedTargetNodes_ref.inverse().get(directCon);
         // 在循环结构中，那么直接在循环条件中插入
         if(isInLoop) {
             // 创建合并后的新条件，'&&'连接
@@ -578,17 +834,19 @@ public class AUGFix {
             // left operand
             if(cursor instanceof WhileStatement) {
                 Expression lExp = (Expression) ASTNode.copySubtree(this.tAST, ((WhileStatement) cursor).getExpression());
+                ((WhileStatement) cursor).setExpression(rltExp);
                 ParenthesizedExpression parenthesizedExp0 = this.tAST.newParenthesizedExpression();
                 parenthesizedExp0.setExpression(lExp);
                 rltExp.setLeftOperand(parenthesizedExp0);
             }
             else if(cursor instanceof ForStatement) {
                 Expression lExp = (Expression) ASTNode.copySubtree(this.tAST, ((ForStatement) cursor).getExpression());
+                ((ForStatement) cursor).setExpression(rltExp);
                 ParenthesizedExpression parenthesizedExp0 = this.tAST.newParenthesizedExpression();
                 parenthesizedExp0.setExpression(lExp);
-                rltExp.setLeftOperand(lExp);
+                rltExp.setLeftOperand(parenthesizedExp0);
             }
-            ((WhileStatement) cursor).setExpression(rltExp);
+            this.addedNodesToBeDeleted.add(this.addedTargetNodes_ref.inverse().get(directCon));
             return ;
         }
         // 不在循环结构中
@@ -614,15 +872,15 @@ public class AUGFix {
             for(Node node : tBranchNodes) {
                 if( (this.anOverlap.getTargetNodeByPatternNode().keySet().contains(node)
                         && !this.missingNodes.contains(node))
-                        || this.addedNodesToBeDeleted.contains(this.addedTargetNodes.inverse().get(node))) {
+                        || this.addedNodesToBeDeleted.contains(this.addedTargetNodes_ref.inverse().get(node))) {
                     mappedNode = node;
                     break;
                 }
             }
             if(mappedNode != null) {
                 // 找到该匹配语句的所在block
-                ASTNode originBlock = ((BaseNode) this.anOverlap.getMappedTargetNode(mappedNode)) == null ? this.addedTargetNodes.inverse().get(mappedNode) : ((BaseNode) this.anOverlap.getMappedTargetNode(mappedNode)).egroumNode.getAstNode();
-                ASTNode mappedStmt = ((BaseNode) this.anOverlap.getMappedTargetNode(mappedNode)) == null ? this.addedTargetNodes.inverse().get(mappedNode) : ((BaseNode) this.anOverlap.getMappedTargetNode(mappedNode)).egroumNode.getAstNode();
+                ASTNode originBlock = ((BaseNode) this.anOverlap.getMappedTargetNode(mappedNode)) == null ? this.addedTargetNodes_ref.inverse().get(mappedNode) : ((BaseNode) this.anOverlap.getMappedTargetNode(mappedNode)).egroumNode.getAstNode();
+                ASTNode mappedStmt = ((BaseNode) this.anOverlap.getMappedTargetNode(mappedNode)) == null ? this.addedTargetNodes_ref.inverse().get(mappedNode) : ((BaseNode) this.anOverlap.getMappedTargetNode(mappedNode)).egroumNode.getAstNode();
                 while (!(mappedStmt instanceof Statement)) {
                     mappedStmt = mappedStmt.getParent();
                 }
@@ -645,17 +903,35 @@ public class AUGFix {
                     }
                 }
                 int mappedIndex = ((Block) originBlock).statements().indexOf(mappedStmt);
+                // find T branch nodes in target
+                Set<Statement> targetTBranch = getBranchStatements(tBranchNodes);
                 // 如果是构造函数
                 if(returnType.equals("isConstructor")) {
                     // 如果T分支内存在已匹配的语句，那么if括住它之后的所有语句
                     IfStatement newIfStmt = this.tAST.newIfStatement();
                     newIfStmt.setExpression(newCon);
+                    this.addedNodesToBeDeleted.add(this.addedTargetNodes_ref.inverse().get(directCon));
                     Block newIfBody = this.tAST.newBlock();
-                    Iterator stmtIt = ((Block) originBlock).statements().subList(mappedIndex, ((Block) originBlock).statements().size() - 1).iterator();
+                    Block newElseBody = this.tAST.newBlock();
+                    // find statements irrelevant to pattern-then-stmts in target
+                    Set<Statement> newElseBlock = findIrrelevantStmts(targetTBranch, (Statement) mappedStmt);
+                    newIfStmt.setThenStatement(newIfBody);
+                    newIfStmt.setElseStatement(newElseBody);
+                    Iterator stmtIt = ((Block) originBlock).statements().subList(mappedIndex, ((Block) originBlock).statements().size()).iterator();
+                    Set<Statement> newThenBlock = new LinkedHashSet<>();
                     while (stmtIt.hasNext()) {
                         Statement stmt = (Statement) stmtIt.next();
-                        stmtIt.remove();
+                        newThenBlock.add(stmt);
+                        //stmt.delete();
+                        //newIfBody.statements().add(stmt);
+                    }
+                    for(Statement stmt : newThenBlock) {
+                        stmt.delete();
                         newIfBody.statements().add(stmt);
+                    }
+                    for(Statement stmt : newElseBlock) {
+                        Statement newStmt = (Statement) ASTNode.copySubtree(this.tAST, stmt);
+                        newElseBody.statements().add(newStmt);
                     }
                     ((Block) originBlock).statements().add(newIfStmt);
                     return ;
@@ -670,18 +946,31 @@ public class AUGFix {
                     parenthesizedExp.setExpression(newCon);
                     rltExp.setOperand(parenthesizedExp);
                     newIfStmt.setExpression(rltExp);
+                    this.addedNodesToBeDeleted.add(this.addedTargetNodes_ref.inverse().get(directCon));
                     Block newIfBody = this.tAST.newBlock(); // then-body
+                    // find statements irrelevant to pattern-then-stmts in target
+                    Set<Statement> newThenBlock = findIrrelevantStmts(targetTBranch, (Statement) mappedStmt);
                     newIfStmt.setThenStatement(newIfBody);
-                    ReturnStatement defaultReturn = createDefaultReturn(returnType);
-                    newIfBody.statements().add(defaultReturn);
+                    for(Statement stmt : newThenBlock) {
+                        //stmt.delete();
+                        Statement newStmt = (Statement) ASTNode.copySubtree(this.tAST, stmt);
+                        newIfBody.statements().add(newStmt);
+                    }
+                    int newIfBodySize = newIfBody.statements().size();
+                    if((newIfBodySize > 0 && !(newIfBody.statements().get(newIfBodySize-1) instanceof ReturnStatement))
+                            || newIfBodySize == 0) {
+                        ReturnStatement defaultReturn = createDefaultReturn(returnType);
+                        newIfBody.statements().add(defaultReturn);
+                    }
                     // insert if stmt
                     ((Block) originBlock).statements().add(mappedIndex, newIfStmt);
+                    // update defUseInfoMap
+                    updateDefUseInfo(newIfStmt, this.md, mappedStmt);
                     return ;
                 }
             }
             // 如果不存在已匹配的，那么跳过此节点，先创建这些分支内的节点再回来创建if
             else {
-                this.addedNodesToBeDeleted.remove(this.addedTargetNodes.inverse().get(directCon));
                 return ;
             }
         }
@@ -770,7 +1059,7 @@ public class AUGFix {
                 }
                 // 缺失的节点
                 else {
-                    ASTNode cnode = this.addedTargetNodes.inverse().get(pNode);
+                    ASTNode cnode = this.addedTargetNodes_ref.inverse().get(pNode);
                     Statement cStmt = createStatementNode(pNode, cnode);
                     tmpStmts.add(cStmt);
                     this.addedNodesToBeDeleted.add(cnode);
@@ -844,7 +1133,7 @@ public class AUGFix {
                     }
                     // 是缺失的节点直接创建语句节点并添加
                     else {
-                        ASTNode cnode = this.addedTargetNodes.inverse().get(pNode);
+                        ASTNode cnode = this.addedTargetNodes_ref.inverse().get(pNode);
                         Statement cStmt = createStatementNode(pNode, cnode);
                         newCatchBody.statements().add(cStmt);
                         this.addedNodesToBeDeleted.add(cnode);
@@ -931,7 +1220,7 @@ public class AUGFix {
                 }
                 // 把这个简单的表达式节点根据pattern aug包装成语句节点
                 else {
-                    ASTNode fnode = this.addedTargetNodes.inverse().get(pNode); // 对应的给target新创建的astNode
+                    ASTNode fnode = this.addedTargetNodes_ref.inverse().get(pNode); // 对应的给target新创建的astNode
                     Statement fStmt = createStatementNode(pNode, fnode);
                     tmpStmts.add(fStmt);
                     // remove related "missing and finally" nodes in later iterations
@@ -959,7 +1248,7 @@ public class AUGFix {
             Block insertTry = null;
             int insertTryPos = -1;
             for(Node pNode : finallyNodes) {
-                ASTNode fnode = this.addedTargetNodes.inverse().get(pNode); // 对应的给target新创建的astNode
+                ASTNode fnode = this.addedTargetNodes_ref.inverse().get(pNode); // 对应的给target新创建的astNode
                 ASTNode fStmt;
                 if(fnode != null) {
                     fStmt = createStatementNode(pNode, fnode);
@@ -1032,7 +1321,7 @@ public class AUGFix {
                         ((Block) block).statements().remove(tstmt);
                     }
                     else { // 否则直接添加即可
-                        tnode = this.addedTargetNodes.inverse().get(pNode); // 对应的给target新创建的astNode
+                        tnode = this.addedTargetNodes_ref.inverse().get(pNode); // 对应的给target新创建的astNode
                         tstmt = createStatementNode(pNode, tnode);
                         //this.addedTargetNodes.remove(tnode);
                         this.addedNodesToBeDeleted.add(tnode);
@@ -1061,9 +1350,15 @@ public class AUGFix {
                     tVarDecFrag.setName(name);
                     tVarDecFrag.setInitializer(exp);
                     VariableDeclarationStatement tVarDecStmt = this.tAST.newVariableDeclarationStatement(tVarDecFrag);
-                    Type tVarType = this.tAST.newSimpleType(this.tAST.newName(((AggregateDataNode) oedge.getTarget()).dataType));
+                    String type = ((AggregateDataNode) oedge.getTarget()).dataType;
+                    Type tVarType;
+                    if(Character.isUpperCase(type.charAt(0)))
+                        tVarType = this.tAST.newSimpleType(this.tAST.newName(((AggregateDataNode) oedge.getTarget()).dataType));
+                    else
+                        tVarType = this.tAST.newPrimitiveType(PrimitiveType.toCode(type));
                     tVarDecStmt.setType(tVarType);
                     return tVarDecStmt;
+
                 }
                 else {
                     Assignment tAssign = this.tAST.newAssignment();
@@ -1079,8 +1374,14 @@ public class AUGFix {
         Statement newStmt;
         if(tASTNode instanceof Statement)
             newStmt = (Statement) tASTNode;
-        else
-            newStmt = this.tAST.newExpressionStatement((Expression) tASTNode);
+        else {
+            //tASTNode = ASTNode.copySubtree(this.tAST, tASTNode); //如果在函数中改变了副本的地址，如new一个，那么副本就指向了一个新的地址，此时传入的参数还是指向原来的地址，所以不会改变参数的值
+            if(tASTNode.getParent() != null && tASTNode.getParent() instanceof Statement)
+                newStmt = (Statement) tASTNode.getParent();
+            else
+                newStmt = this.tAST.newExpressionStatement((Expression) tASTNode);
+            //TODO: how to change the state of tASTNode since methods can't attach new objects to object parameters
+        }
         return newStmt;
     }
 
@@ -1101,6 +1402,9 @@ public class AUGFix {
         }
         // Infix expression
         else if(mNode instanceof NullCheckNode) {
+            return buildTargetNode((InfixOperatorNode) mNode);
+        }
+        else if(mNode instanceof InfixOperatorNode) {
             return buildTargetNode((InfixOperatorNode) mNode);
         }
         // directly copy as default
@@ -1173,7 +1477,6 @@ public class AUGFix {
     }
 
     private ASTNode buildTargetNode(MethodCallNode mNode) {
-        MethodInvocation tNode;
         if(hasArgs(mNode, this.aPattern)) {
             ASTNode pNode = ((BaseNode) mNode).egroumNode.getAstNode();
             if(pNode instanceof ClassInstanceCreation)
@@ -1181,9 +1484,12 @@ public class AUGFix {
             else
                 return createTargetASTNode((MethodInvocation) pNode);
         }
-        tNode = this.tAST.newMethodInvocation();
+        ASTNode pNode = ((BaseNode) mNode).egroumNode.getAstNode();
+        if(pNode instanceof ClassInstanceCreation)
+            return createTargetASTNode((ClassInstanceCreation) pNode);
         // method name
         String methodSig = mNode.getMethodSignature();
+        MethodInvocation tNode = this.tAST.newMethodInvocation();
         String methodName = methodSig.substring(0, methodSig.length()-2);
         SimpleName methodNameNode = this.tAST.newSimpleName(methodName);
         tNode.setName(methodNameNode);
@@ -1223,7 +1529,7 @@ public class AUGFix {
             // receiver是methodcall
             if(tRecv.startsWith("dummy")) {
                 for(Node anode : this.anOverlap.getTargetNodeByPatternNode().keySet()) {
-                    if(anode instanceof ActionNode)
+                    if(anode instanceof ActionNode || this.anOverlap.getMappedTargetNode(anode) instanceof LiteralNode)
                         continue;
                     if(((DataNode) this.anOverlap.getMappedTargetNode(anode)).getName().equals(tRecv)) {
                         // anode是receiver
@@ -1291,6 +1597,13 @@ public class AUGFix {
                 }
             }
         }
+        if(tVar.contains(".")) {
+            tVar = tVar.substring(tVar.indexOf(".")+1);
+        }
+        else if(isStartsWithNumber(tVar)) {
+            tNode = this.tAST.newNumberLiteral(tVar);
+            return tNode;
+        }
         tNode = this.tAST.newSimpleName(tVar);
         return tNode;
     }
@@ -1330,7 +1643,7 @@ public class AUGFix {
             //TODO: need to consider when a method invocation is passed as an argument
             if(arg instanceof SimpleName) {
                 // get mapped var
-                SimpleName tVar = (SimpleName) createTargetASTNode((SimpleName) arg);
+                ASTNode tVar = createTargetASTNode((SimpleName) arg);
                 tNode.arguments().add(tVar);
             }
             else {
@@ -1344,50 +1657,52 @@ public class AUGFix {
     }
 
     private String findMappedVar(String pVar) {
-        try {
-            if(this.targetVarByPattern.containsKey(pVar)) {
-                return this.targetVarByPattern.get(pVar);
-            }
-            if(pVar.length() > 0 && Character.isUpperCase(pVar.charAt(0))) {
-                this.targetVarByPattern.put(pVar, pVar);
-                return pVar;
-            }
-            String tVar;
-            // pVar在target已mapped
-            for(Node node : this.anOverlap.getTargetNodeByPatternNode().keySet()) {
-                if(node instanceof AggregateDataNode) {
-                    for(Node varNode : ((AggregateDataNode) node).aggregatedNodes) {
-                        if(varNode instanceof LiteralNode)
-                            continue;
-                        if(((DataNode) varNode).getName().equals(pVar)
-                                || (((DataNode) varNode).getName() + getEGroumId(varNode)).equals(pVar)) {
-                            Node tVarNode = this.anOverlap.getTargetNodeByPatternNode().get(node);
-                            tVar = ((DataNode) tVarNode).getName();
-                            if(tVar.equals("dummy_"))
-                                tVar += "new" + this.newVarId++;
-                            ((DataNode) tVarNode).setName(tVar);
-                            this.targetVarByPattern.put(pVar, tVar);
-                            return tVar;
+        if(this.targetVarByPattern.containsKey(pVar)) {
+            return this.targetVarByPattern.get(pVar);
+        }
+        if(pVar.length() > 0 && Character.isUpperCase(pVar.charAt(0))) {
+            this.targetVarByPattern.put(pVar, pVar);
+            return pVar;
+        }
+        String tVar;
+        // pVar在target已mapped
+        for(Node node : this.anOverlap.getTargetNodeByPatternNode().keySet()) {
+            if(node instanceof AggregateDataNode) {
+                for(Node varNode : ((AggregateDataNode) node).aggregatedNodes) {
+                    if(varNode instanceof LiteralNode)
+                        continue;
+                    if(((DataNode) varNode).getName().equals(pVar)
+                            || (((DataNode) varNode).getName() + getEGroumId(varNode)).equals(pVar)) {
+                        Node tVarNode = this.anOverlap.getTargetNodeByPatternNode().get(node);
+                        if(tVarNode instanceof LiteralNode) {
+                            tVar = ((LiteralNode) tVarNode).getValue();
                         }
+                        else {
+                            tVar = ((DataNode) tVarNode).getName();
+                        }
+                        if(tVar.equals("dummy_")) {
+                            tVar += "new" + this.newVarId++;
+                            ((DataNode) tVarNode).setName(tVar);
+                        }
+                        this.targetVarByPattern.put(pVar, tVar);
+                        return tVar;
                     }
                 }
             }
-            // pVar在target没有mapped
-            if(pVar.startsWith("dummy_")) {
-                tVar = "dummy_new" + this.newVarId++;
-                this.targetVarByPattern.put(pVar, tVar);
-                return tVar;
-            }
-            throw new IllegalArgumentException();
-        } catch (IllegalArgumentException e) {
-            LOGGER.info("Finding target fix: "
-                    + "#Violation" + this.violationId + "# "
-                    + "[var]" + pVar + " in pattern not mapped "
-                    + "in [target]" + this.aTarget.getLocation().getFilePath() + " "
-                    + this.aTarget.getLocation().getMethodSignature());
-            this.mistakeId++;
-            return "NOTEXIST";
         }
+        // pVar在target没有mapped
+        if(pVar.startsWith("dummy_")) {
+            tVar = "dummy_new" + this.newVarId++;
+            this.targetVarByPattern.put(pVar, tVar);
+            return tVar;
+        }
+        LOGGER.info("Finding target fix: "
+                + "#Violation" + this.violationId + "# "
+                + "[var]" + pVar + " in pattern not mapped "
+                + "in [target]" + this.aTarget.getLocation().getFilePath() + " "
+                + this.aTarget.getLocation().getMethodSignature());
+        //this.mistakeId++;
+        return "NOTEXIST";
     }
 
     /*
@@ -1533,5 +1848,169 @@ public class AUGFix {
             continue;
         }
         return false;
+    }
+
+    private boolean isStartsWithNumber(String str) {
+        Pattern pattern = Pattern.compile("[0-9].*");
+        Matcher isNum = pattern.matcher(str.charAt(0) + "");
+        if(!isNum.matches()) {
+            return false;
+        }
+        return true;
+    }
+
+    private Map<Statement, DefUseInfo> findDefUseInfo(Statement stmt, MethodDeclaration md) {
+        Map<Statement, DefUseInfo> result = new LinkedHashMap<>();
+        if(stmt instanceof IfStatement) {
+            result.put(stmt, new DefUseInfo(md, stmt)); //this.defUseInfoMap.put(stmt, new DefUseInfo(md, stmt));
+            Statement thenStmt = ((IfStatement) stmt).getThenStatement();
+            if(thenStmt != null) {
+                result.putAll(findDefUseInfo(thenStmt, md, result.get(stmt).use)); //findDefUseInfo(thenStmt, md);
+            }
+            Statement elseStmt = ((IfStatement) stmt).getElseStatement();
+            if(elseStmt != null) {
+                result.putAll(findDefUseInfo(elseStmt, md)); //findDefUseInfo(elseStmt, md);
+            }
+        }
+        else if(stmt instanceof WhileStatement) {
+            result.put(stmt, new DefUseInfo(md, stmt)); //this.defUseInfoMap.put(stmt, new DefUseInfo(md, stmt));
+            Statement loopStmt = ((WhileStatement) stmt).getBody();
+            if(loopStmt != null) {
+                result.putAll(findDefUseInfo(loopStmt, md, result.get(stmt).use)); //findDefUseInfo(loopStmt, md);
+            }
+        }
+        else if(stmt instanceof DoStatement) {
+            result.put(stmt, new DefUseInfo(md, stmt));
+            Statement loopStmt = ((DoStatement) stmt).getBody();
+            if(loopStmt != null) {
+                result.putAll(findDefUseInfo(loopStmt, md, result.get(stmt).use));
+            }
+        }
+        else if(stmt instanceof ForStatement) {
+            result.put(stmt, new DefUseInfo(md, stmt)); //this.defUseInfoMap.put(stmt, new DefUseInfo(md, stmt));
+            Statement loopStmt = ((ForStatement) stmt).getBody();
+            if(loopStmt != null) {
+                result.putAll(findDefUseInfo(loopStmt, md, result.get(stmt).use)); //findDefUseInfo(loopStmt, md);
+            }
+        }
+        else if(stmt instanceof EnhancedForStatement) {
+            result.put(stmt, new DefUseInfo(md, stmt)); //this.defUseInfoMap.put(stmt, new DefUseInfo(md, stmt));
+            Statement loopStmt = ((EnhancedForStatement) stmt).getBody();
+            if(loopStmt != null) {
+                result.putAll(findDefUseInfo(loopStmt, md, result.get(stmt).use)); //findDefUseInfo(loopStmt, md);
+            }
+        }
+        else if(stmt instanceof TryStatement) {
+            result.put(stmt, new DefUseInfo(md, stmt));
+            Statement tryStmt = ((TryStatement) stmt).getBody();
+            result.putAll(findDefUseInfo(tryStmt, md)); //findDefUseInfo(tryStmt, md);
+            for(Object catchClause : ((TryStatement) stmt).catchClauses()) {
+                Statement catchStmt = ((CatchClause) catchClause).getBody();
+                result.putAll(findDefUseInfo(catchStmt, md)); //findDefUseInfo(catchStmt, md);
+            }
+            Statement finallyStmt = ((TryStatement) stmt).getFinally();
+            if(finallyStmt != null) {
+                result.putAll(findDefUseInfo(finallyStmt, md)); //findDefUseInfo(finallyStmt, md);
+            }
+        }
+        else if(stmt instanceof Block) {
+            result.put(stmt, new DefUseInfo(md, stmt));
+            for(Object s : ((Block) stmt).statements()) {
+                result.putAll(findDefUseInfo((Statement) s, md)); //findDefUseInfo((Statement) s, md);
+            }
+        }
+        else if(stmt instanceof SwitchStatement) {
+            result.put(stmt, new DefUseInfo(md, stmt));
+            Set<String> preUse = result.get(stmt).use;
+            for(Object s : ((SwitchStatement) stmt).statements()) {
+                Map<Statement, DefUseInfo> tmp = findDefUseInfo((Statement) s, md, preUse);
+                result.putAll(tmp);
+                for(DefUseInfo info : tmp.values()) {
+                    result.get(stmt).def.addAll(info.def);
+                    result.get(stmt).use.addAll(info.use);
+                }
+            }
+        }
+        else {
+            result.put(stmt, new DefUseInfo(md, stmt)); //this.defUseInfoMap.put(stmt, new DefUseInfo(md, stmt));
+        }
+        return result;
+    }
+
+    private Map<Statement,DefUseInfo> findDefUseInfo(Statement stmt, MethodDeclaration md, Set<String> preUse) {
+        Map<Statement, DefUseInfo> result = new LinkedHashMap<>();
+        if(stmt instanceof IfStatement) {
+            result.put(stmt, new DefUseInfo(md, stmt, preUse)); //this.defUseInfoMap.put(stmt, new DefUseInfo(md, stmt));
+            Statement thenStmt = ((IfStatement) stmt).getThenStatement();
+            if(thenStmt != null) {
+                result.putAll(findDefUseInfo(thenStmt, md, preUse)); //findDefUseInfo(thenStmt, md);
+            }
+            Statement elseStmt = ((IfStatement) stmt).getElseStatement();
+            if(elseStmt != null) {
+                result.putAll(findDefUseInfo(elseStmt, md, preUse)); //findDefUseInfo(elseStmt, md);
+            }
+        }
+        else if(stmt instanceof WhileStatement) {
+            result.put(stmt, new DefUseInfo(md, stmt, preUse)); //this.defUseInfoMap.put(stmt, new DefUseInfo(md, stmt));
+            Statement loopStmt = ((WhileStatement) stmt).getBody();
+            if(loopStmt != null) {
+                result.putAll(findDefUseInfo(loopStmt, md, preUse)); //findDefUseInfo(loopStmt, md);
+            }
+        }
+        else if(stmt instanceof DoStatement) {
+            result.put(stmt, new DefUseInfo(md, stmt, preUse));
+            Statement loopStmt = ((DoStatement) stmt).getBody();
+            if(loopStmt != null) {
+                result.putAll(findDefUseInfo(loopStmt, md, preUse));
+            }
+        }
+        else if(stmt instanceof ForStatement) {
+            result.put(stmt, new DefUseInfo(md, stmt, preUse)); //this.defUseInfoMap.put(stmt, new DefUseInfo(md, stmt));
+            Statement loopStmt = ((ForStatement) stmt).getBody();
+            if(loopStmt != null) {
+                result.putAll(findDefUseInfo(loopStmt, md, preUse)); //findDefUseInfo(loopStmt, md);
+            }
+        }
+        else if(stmt instanceof EnhancedForStatement) {
+            result.put(stmt, new DefUseInfo(md, stmt, preUse)); //this.defUseInfoMap.put(stmt, new DefUseInfo(md, stmt));
+            Statement loopStmt = ((EnhancedForStatement) stmt).getBody();
+            if(loopStmt != null) {
+                result.putAll(findDefUseInfo(loopStmt, md, preUse)); //findDefUseInfo(loopStmt, md);
+            }
+        }
+        else if(stmt instanceof TryStatement) {
+            result.put(stmt, new DefUseInfo(md, stmt, preUse));
+            Statement tryStmt = ((TryStatement) stmt).getBody();
+            result.putAll(findDefUseInfo(tryStmt, md, preUse)); //findDefUseInfo(tryStmt, md);
+            for(Object catchClause : ((TryStatement) stmt).catchClauses()) {
+                Statement catchStmt = ((CatchClause) catchClause).getBody();
+                result.putAll(findDefUseInfo(catchStmt, md, preUse)); //findDefUseInfo(catchStmt, md);
+            }
+            Statement finallyStmt = ((TryStatement) stmt).getFinally();
+            if(finallyStmt != null) {
+                result.putAll(findDefUseInfo(finallyStmt, md, preUse)); //findDefUseInfo(finallyStmt, md);
+            }
+        }
+        else if(stmt instanceof Block) {
+            result.put(stmt, new DefUseInfo(md, stmt, preUse));
+            for(Object s : ((Block) stmt).statements()) {
+                result.putAll(findDefUseInfo((Statement) s, md, preUse)); //findDefUseInfo((Statement) s, md);
+            }
+        }
+        else if(stmt instanceof SwitchStatement) {
+            result.put(stmt, new DefUseInfo(md, stmt, preUse));
+            for(Object s : ((SwitchStatement) stmt).statements()) {
+                Map<Statement, DefUseInfo> tmp = findDefUseInfo((Statement) s, md, preUse);
+                result.putAll(tmp);
+                for(DefUseInfo info : tmp.values()) {
+                    result.get(stmt).def.addAll(info.def);
+                    result.get(stmt).use.addAll(info.use);
+                }
+            }
+        }
+        else {
+            result.put(stmt, new DefUseInfo(md, stmt, preUse)); //this.defUseInfoMap.put(stmt, new DefUseInfo(md, stmt));
+        }
+        return result;
     }
 }
